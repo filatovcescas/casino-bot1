@@ -38,7 +38,7 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_TOKEN_HERE")
-ADMIN_IDS = {123456789}  # замени на свой Telegram ID
+ADMIN_IDS = {8039924340}  # замени на свой Telegram ID
 DB_PATH = "casino.db"
 
 START_BALANCE = 5000
