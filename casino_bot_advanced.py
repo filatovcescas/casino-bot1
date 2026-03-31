@@ -7,19 +7,18 @@ casino_bot_advanced.py
 - рулетка
 - блэкджек
 - баланс
-- перевод денег: /pay user_id сумма или ответом /pay сумма
-- админка: /give, /setbal
+- перевод денег с комментарием: /pay user_id сумма комментарий
+- админка: /give, /setbal, /ban, /unban, /setchance
+- бан игроков
 - общий топ: /top
 - топ недели: /topweek
+- работа таксистом: /taxi (2500 за поездку)
+- капча: /captcha (1000 за ввод)
+- кости: /dice @user сумма
 - в начале новой недели топ-3 по weekly_profit получают по 50 000
 
 Установка:
     python -m pip install aiogram aiosqlite
-
-Для Render:
-- Background Worker
-- Start Command: python casino_bot_advanced.py
-- Environment variable: BOT_TOKEN=...
 """
 
 from __future__ import annotations
@@ -27,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -49,6 +49,8 @@ WEEKLY_WINNERS_COUNT = 3
 dp = Dispatcher()
 db = None
 blackjack_games: dict[int, "BJGame"] = {}
+pending_dice_games: dict[int, "DiceGame"] = {}
+pending_captcha: dict[int, dict] = {}
 
 
 @dataclass
@@ -56,6 +58,15 @@ class BJGame:
     bet: int
     player_total: int
     dealer_total: int
+
+
+@dataclass
+class DiceGame:
+    opponent_id: int
+    opponent_name: str
+    bet: int
+    challenger_roll: int | None = None
+    opponent_roll: int | None = None
 
 
 class Database:
@@ -73,7 +84,9 @@ class Database:
                 balance INTEGER NOT NULL DEFAULT 0,
                 current_bet INTEGER NOT NULL DEFAULT 100,
                 weekly_profit INTEGER NOT NULL DEFAULT 0,
-                total_profit INTEGER NOT NULL DEFAULT 0
+                total_profit INTEGER NOT NULL DEFAULT 0,
+                banned BOOLEAN DEFAULT 0,
+                ban_reason TEXT DEFAULT ''
             )
             """
         )
@@ -85,6 +98,25 @@ class Database:
             )
             """
         )
+        await self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS casino_settings (
+                setting_name TEXT PRIMARY KEY,
+                value REAL
+            )
+            """
+        )
+        # Настройки шансов по умолчанию
+        default_settings = {
+            'roulette_win_chance': 0.48,
+            'blackjack_win_chance': 0.49,
+            'slots_win_chance': 0.40
+        }
+        for name, val in default_settings.items():
+            await self.conn.execute(
+                "INSERT OR IGNORE INTO casino_settings (setting_name, value) VALUES (?, ?)",
+                (name, val)
+            )
         await self.conn.commit()
 
     async def close(self) -> None:
@@ -99,8 +131,8 @@ class Database:
         if row is None:
             await self.conn.execute(
                 """
-                INSERT INTO users (user_id, username, balance, current_bet, weekly_profit, total_profit)
-                VALUES (?, ?, ?, ?, 0, 0)
+                INSERT INTO users (user_id, username, balance, current_bet, weekly_profit, total_profit, banned, ban_reason)
+                VALUES (?, ?, ?, ?, 0, 0, 0, '')
                 """,
                 (user_id, username, START_BALANCE, DEFAULT_BET),
             )
@@ -109,6 +141,28 @@ class Database:
                 "UPDATE users SET username = ? WHERE user_id = ?",
                 (username, user_id),
             )
+        await self.conn.commit()
+
+    async def is_banned(self, user_id: int) -> tuple[bool, str]:
+        cur = await self.conn.execute("SELECT banned, ban_reason FROM users WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
+        await cur.close()
+        if row and row[0]:
+            return True, row[1] or "Не указана"
+        return False, ""
+
+    async def ban_user(self, user_id: int, reason: str = "") -> None:
+        await self.conn.execute(
+            "UPDATE users SET banned = 1, ban_reason = ? WHERE user_id = ?",
+            (reason, user_id)
+        )
+        await self.conn.commit()
+
+    async def unban_user(self, user_id: int) -> None:
+        await self.conn.execute(
+            "UPDATE users SET banned = 0, ban_reason = '' WHERE user_id = ?",
+            (user_id,)
+        )
         await self.conn.commit()
 
     async def get_balance(self, user_id: int) -> int:
@@ -155,7 +209,7 @@ class Database:
         )
         await self.conn.commit()
 
-    async def transfer(self, sender_id: int, target_id: int, amount: int) -> bool:
+    async def transfer(self, sender_id: int, target_id: int, amount: int, comment: str = "") -> bool:
         if amount <= 0:
             return False
         sender_balance = await self.get_balance(sender_id)
@@ -164,12 +218,17 @@ class Database:
 
         await self.conn.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, sender_id))
         await self.conn.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, target_id))
+        if comment:
+            await self.conn.execute(
+                "INSERT INTO transfers (sender_id, target_id, amount, comment, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (sender_id, target_id, amount, comment, datetime.now(timezone.utc).isoformat())
+            )
         await self.conn.commit()
         return True
 
     async def top_balance(self, limit: int = 10) -> list[tuple[int, str | None, int]]:
         cur = await self.conn.execute(
-            "SELECT user_id, username, balance FROM users ORDER BY balance DESC LIMIT ?",
+            "SELECT user_id, username, balance FROM users WHERE banned = 0 ORDER BY balance DESC LIMIT ?",
             (limit,),
         )
         rows = await cur.fetchall()
@@ -181,6 +240,7 @@ class Database:
             """
             SELECT user_id, username, weekly_profit
             FROM users
+            WHERE banned = 0
             ORDER BY weekly_profit DESC, balance DESC
             LIMIT ?
             """,
@@ -207,12 +267,25 @@ class Database:
         )
         await self.conn.commit()
 
+    async def get_setting(self, setting_name: str) -> float:
+        cur = await self.conn.execute("SELECT value FROM casino_settings WHERE setting_name = ?", (setting_name,))
+        row = await cur.fetchone()
+        await cur.close()
+        return float(row[0]) if row else 0.5
+
+    async def set_setting(self, setting_name: str, value: float) -> None:
+        await self.conn.execute(
+            "UPDATE casino_settings SET value = ? WHERE setting_name = ?",
+            (value, setting_name)
+        )
+        await self.conn.commit()
+
     async def reward_weekly_top(self) -> list[tuple[int, str | None]]:
         cur = await self.conn.execute(
             """
             SELECT user_id, username
             FROM users
-            WHERE weekly_profit > 0
+            WHERE weekly_profit > 0 AND banned = 0
             ORDER BY weekly_profit DESC, balance DESC
             LIMIT ?
             """,
@@ -244,6 +317,10 @@ def card_value() -> int:
     return random.choice([2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11])
 
 
+def roll_dice() -> int:
+    return random.randint(1, 6)
+
+
 def fmt_money(value: int) -> str:
     return f"{value:,}".replace(",", " ") + " 💵"
 
@@ -256,6 +333,19 @@ def current_week_key() -> str:
     now = datetime.now(timezone.utc)
     year, week, _ = now.isocalendar()
     return f"{year}-W{week:02d}"
+
+
+def generate_captcha() -> tuple[str, str]:
+    a = random.randint(1, 50)
+    b = random.randint(1, 50)
+    operators = ['+', '-']
+    op = random.choice(operators)
+    if op == '+':
+        result = a + b
+    else:
+        result = a - b
+    question = f"{a} {op} {b}"
+    return question, str(result)
 
 
 def main_menu() -> InlineKeyboardMarkup:
@@ -276,6 +366,10 @@ def main_menu() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="🎯 Ставка", callback_data="menu:bet"),
                 InlineKeyboardButton(text="📘 Помощь", callback_data="menu:help"),
+            ],
+            [
+                InlineKeyboardButton(text="🚖 Такси", callback_data="menu:taxi"),
+                InlineKeyboardButton(text="🎲 Кости", callback_data="menu:dice"),
             ],
             [
                 InlineKeyboardButton(text="🛠 Админ", callback_data="menu:admin"),
@@ -323,6 +417,17 @@ def blackjack_menu() -> InlineKeyboardMarkup:
     )
 
 
+def admin_settings_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎰 Шансы слотов", callback_data="admin:slots_chance")],
+            [InlineKeyboardButton(text="🎡 Шансы рулетки", callback_data="admin:roulette_chance")],
+            [InlineKeyboardButton(text="🃏 Шансы блэкджека", callback_data="admin:blackjack_chance")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:admin")],
+        ]
+    )
+
+
 async def ensure_user_from_message(message: Message) -> int:
     if message.from_user is None:
         raise RuntimeError("Не удалось определить пользователя")
@@ -343,9 +448,21 @@ async def safe_edit_or_send(call: CallbackQuery, text: str, reply_markup: Inline
     await call.answer()
 
 
+async def check_ban(message: Message) -> bool:
+    banned, reason = await db.is_banned(message.from_user.id)
+    if banned:
+        await message.answer(f"❌ Вы забанены.\nПричина: {reason}")
+        return True
+    return False
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message) -> None:
     user_id = await ensure_user_from_message(message)
+    banned, reason = await db.is_banned(user_id)
+    if banned:
+        await message.answer(f"❌ Вы забанены.\nПричина: {reason}")
+        return
     balance = await db.get_balance(user_id)
     bet = await db.get_bet(user_id)
     await message.answer(
@@ -359,12 +476,16 @@ async def cmd_start(message: Message) -> None:
 
 @dp.message(Command("menu"))
 async def cmd_menu(message: Message) -> None:
+    if await check_ban(message):
+        return
     await ensure_user_from_message(message)
     await message.answer("🏠 <b>Главное меню</b>", reply_markup=main_menu())
 
 
 @dp.message(Command("balance"))
 async def cmd_balance(message: Message) -> None:
+    if await check_ban(message):
+        return
     user_id = await ensure_user_from_message(message)
     balance = await db.get_balance(user_id)
     bet = await db.get_bet(user_id)
@@ -376,6 +497,8 @@ async def cmd_balance(message: Message) -> None:
 
 @dp.message(Command("setbet"))
 async def cmd_setbet(message: Message) -> None:
+    if await check_ban(message):
+        return
     user_id = await ensure_user_from_message(message)
     parts = (message.text or "").split()
     if len(parts) != 2:
@@ -401,8 +524,256 @@ async def cmd_setbet(message: Message) -> None:
     await message.answer(f"✅ Новая ставка: <b>{fmt_money(amount)}</b>")
 
 
+@dp.message(Command("taxi"))
+async def cmd_taxi(message: Message) -> None:
+    """Работа таксистом: 2500 за поездку"""
+    if await check_ban(message):
+        return
+    user_id = await ensure_user_from_message(message)
+    earnings = 2500
+    await db.add_balance(user_id, earnings)
+    await db.add_profit(user_id, earnings)
+    await message.answer(f"🚖 Вы выполнили заказ такси и заработали {fmt_money(earnings)}!")
+
+
+@dp.message(Command("captcha"))
+async def cmd_captcha(message: Message) -> None:
+    """Капча: 1000 за правильный ввод"""
+    if await check_ban(message):
+        return
+    user_id = await ensure_user_from_message(message)
+    question, answer = generate_captcha()
+    pending_captcha[user_id] = {"answer": answer, "timestamp": time.time()}
+    await message.answer(f"🔐 <b>Капча</b>\n\nРешите пример: <code>{question}</code>\n\nЗа правильный ответ вы получите 1000 монет.\nУ вас 30 секунд.")
+
+
+@dp.message(Command("dice"))
+async def cmd_dice(message: Message) -> None:
+    """Игра в кости: /dice @user сумма"""
+    if await check_ban(message):
+        return
+    user_id = await ensure_user_from_message(message)
+    parts = (message.text or "").split()
+    
+    if len(parts) < 3:
+        await message.answer("Использование: <code>/dice @username сумма</code> или <code>/dice user_id сумма</code>")
+        return
+    
+    try:
+        amount = int(parts[-1])
+    except ValueError:
+        await message.answer("❌ Сумма должна быть числом.")
+        return
+    
+    if amount <= 0:
+        await message.answer("❌ Сумма должна быть больше нуля.")
+        return
+    
+    balance = await db.get_balance(user_id)
+    if balance < amount:
+        await message.answer("❌ Недостаточно средств для ставки.")
+        return
+    
+    # Определяем оппонента
+    target_username = None
+    target_id = None
+    
+    if message.entities:
+        for entity in message.entities:
+            if entity.type == "mention":
+                username = message.text[entity.offset:entity.offset + entity.length][1:]
+                target_username = username
+                break
+    
+    if not target_username and len(parts) >= 2:
+        try:
+            target_id = int(parts[1])
+        except ValueError:
+            target_username = parts[1].replace("@", "")
+    
+    if target_username:
+        cur = await db.conn.execute("SELECT user_id FROM users WHERE username = ?", (target_username,))
+        row = await cur.fetchone()
+        await cur.close()
+        if row:
+            target_id = row[0]
+    
+    if target_id is None or target_id == user_id:
+        await message.answer("❌ Не удалось найти оппонента или вы указали себя.")
+        return
+    
+    await db.ensure_user(target_id, None)
+    
+    target_balance = await db.get_balance(target_id)
+    if target_balance < amount:
+        await message.answer("❌ У оппонента недостаточно средств.")
+        return
+    
+    # Создаём игру
+    target_name = fmt_name(target_id, None)
+    pending_dice_games[target_id] = DiceGame(
+        opponent_id=user_id,
+        opponent_name=fmt_name(user_id, message.from_user.username),
+        bet=amount
+    )
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎲 Принять игру", callback_data=f"dice:accept:{user_id}:{amount}")],
+            [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"dice:decline:{user_id}")]
+        ]
+    )
+    
+    await message.answer(
+        f"🎲 <b>Игра в кости</b>\n\n"
+        f"Игрок {fmt_name(user_id, message.from_user.username)} бросает вызов!\n"
+        f"Ставка: {fmt_money(amount)}\n"
+        f"У кого выпадет больше число, тот забирает ставку.",
+        reply_markup=keyboard
+    )
+    await message.bot.send_message(target_id, f"🎲 Вам бросают вызов на {fmt_money(amount)}!\nНажмите кнопку, чтобы принять.", reply_markup=keyboard)
+
+
+@dp.callback_query(F.data.startswith("dice:"))
+async def cb_dice_response(call: CallbackQuery) -> None:
+    user_id = await ensure_user_from_callback(call)
+    parts = call.data.split(":")
+    
+    if parts[1] == "accept":
+        challenger_id = int(parts[2])
+        bet = int(parts[3])
+        
+        if user_id == challenger_id:
+            await call.answer("Нельзя принять свой вызов", show_alert=True)
+            return
+        
+        balance = await db.get_balance(user_id)
+        if balance < bet:
+            await call.answer("Недостаточно средств для ставки", show_alert=True)
+            await call.message.edit_text(f"❌ {fmt_name(user_id, call.from_user.username)} не может принять игру: недостаточно средств.")
+            return
+        
+        # Бросаем кости
+        challenger_roll = roll_dice()
+        opponent_roll = roll_dice()
+        
+        # Списываем ставки
+        await db.add_balance(challenger_id, -bet)
+        await db.add_balance(user_id, -bet)
+        
+        # Определяем победителя
+        if challenger_roll > opponent_roll:
+            winner_id = challenger_id
+            winner_roll = challenger_roll
+            loser_roll = opponent_roll
+            winnings = bet * 2
+            await db.add_balance(winner_id, winnings)
+            await db.add_profit(winner_id, winnings)
+            result_text = f"🎉 Победил {fmt_name(challenger_id, None)}!"
+        elif opponent_roll > challenger_roll:
+            winner_id = user_id
+            winner_roll = opponent_roll
+            loser_roll = challenger_roll
+            winnings = bet * 2
+            await db.add_balance(winner_id, winnings)
+            await db.add_profit(winner_id, winnings)
+            result_text = f"🎉 Победил {fmt_name(user_id, call.from_user.username)}!"
+        else:
+            # Ничья - возврат ставок
+            await db.add_balance(challenger_id, bet)
+            await db.add_balance(user_id, bet)
+            result_text = f"🤝 Ничья! Возврат ставок."
+            winner_roll = challenger_roll
+            loser_roll = opponent_roll
+        
+        await call.message.edit_text(
+            f"🎲 <b>Результат игры в кости</b>\n\n"
+            f"{fmt_name(challenger_id, None)} выбросил: <b>{challenger_roll}</b>\n"
+            f"{fmt_name(user_id, call.from_user.username)} выбросил: <b>{opponent_roll}</b>\n\n"
+            f"{result_text}\n\n"
+            f"Баланс {fmt_name(challenger_id, None)}: {fmt_money(await db.get_balance(challenger_id))}\n"
+            f"Баланс {fmt_name(user_id, call.from_user.username)}: {fmt_money(await db.get_balance(user_id))}"
+        )
+        
+    elif parts[1] == "decline":
+        challenger_id = int(parts[2])
+        if user_id == challenger_id:
+            await call.answer("Нельзя отклонить свой вызов", show_alert=True)
+            return
+        await call.message.edit_text(f"❌ Игра отклонена {fmt_name(user_id, call.from_user.username)}.")
+        await call.answer()
+
+
+@dp.message(Command("pay"))
+async def cmd_pay(message: Message) -> None:
+    """Перевод денег с комментарием: /pay user_id сумма комментарий"""
+    if await check_ban(message):
+        return
+    sender_id = await ensure_user_from_message(message)
+    parts = (message.text or "").split(maxsplit=2)
+    
+    target_id = None
+    amount = None
+    comment = ""
+    
+    if message.reply_to_message and len(parts) >= 2:
+        try:
+            amount = int(parts[1])
+            if len(parts) > 2:
+                comment = parts[2]
+        except ValueError:
+            await message.answer("❌ Сумма должна быть числом.")
+            return
+        if message.reply_to_message.from_user is None:
+            await message.answer("❌ Не удалось определить получателя.")
+            return
+        target_id = message.reply_to_message.from_user.id
+        await db.ensure_user(target_id, message.reply_to_message.from_user.username)
+    elif len(parts) >= 3:
+        try:
+            target_id = int(parts[1])
+            amount = int(parts[2])
+            if len(parts) > 3:
+                comment = parts[3]
+        except ValueError:
+            await message.answer("❌ user_id и сумма должны быть числами.")
+            return
+        await db.ensure_user(target_id, None)
+    else:
+        await message.answer(
+            "Использование:\n"
+            "<code>/pay user_id сумма [комментарий]</code>\n"
+            "или ответом:\n"
+            "<code>/pay сумма [комментарий]</code>"
+        )
+        return
+
+    if target_id == sender_id:
+        await message.answer("❌ Нельзя переводить самому себе.")
+        return
+    if amount is None or amount <= 0:
+        await message.answer("❌ Сумма должна быть больше нуля.")
+        return
+
+    ok = await db.transfer(sender_id, target_id, amount, comment)
+    if not ok:
+        await message.answer("❌ Недостаточно средств.")
+        return
+
+    sender_balance = await db.get_balance(sender_id)
+    comment_text = f"\n📝 Комментарий: {comment}" if comment else ""
+    await message.answer(
+        f"💸 Перевод выполнен\n"
+        f"Кому: <code>{target_id}</code>\n"
+        f"Сумма: <b>{fmt_money(amount)}</b>{comment_text}\n"
+        f"Твой баланс: <b>{fmt_money(sender_balance)}</b>"
+    )
+
+
 @dp.message(Command("top"))
 async def cmd_top(message: Message) -> None:
+    if await check_ban(message):
+        return
     await ensure_user_from_message(message)
     rows = await db.top_balance(10)
     text = "🏆 <b>Топ игроков по балансу</b>\n\n"
@@ -413,6 +784,8 @@ async def cmd_top(message: Message) -> None:
 
 @dp.message(Command("topweek"))
 async def cmd_topweek(message: Message) -> None:
+    if await check_ban(message):
+        return
     await ensure_user_from_message(message)
     rows = await db.top_week(10)
     text = (
@@ -433,419 +806,98 @@ async def cmd_admin(message: Message) -> None:
     await message.answer(
         "🛠 <b>Админ-панель</b>\n\n"
         "<code>/give user_id сумма</code>\n"
-        "<code>/setbal user_id сумма</code>"
+        "<code>/setbal user_id сумма</code>\n"
+        "<code>/ban user_id [причина]</code>\n"
+        "<code>/unban user_id</code>\n"
+        "<code>/setchance slots|roulette|blackjack 0.XX</code>"
     )
+
+
+@dp.message(Command("ban"))
+async def cmd_ban(message: Message) -> None:
+    admin_id = await ensure_user_from_message(message)
+    if not is_admin(admin_id):
+        await message.answer("⛔ Только админ.")
+        return
+    
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2:
+        await message.answer("Использование: <code>/ban user_id [причина]</code>")
+        return
+    
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        await message.answer("❌ user_id должен быть числом.")
+        return
+    
+    reason = parts[2] if len(parts) > 2 else "Нарушение правил"
+    
+    await db.ensure_user(target_id, None)
+    await db.ban_user(target_id, reason)
+    await message.answer(f"✅ Игрок <code>{target_id}</code> забанен.\nПричина: {reason}")
+
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: Message) -> None:
+    admin_id = await ensure_user_from_message(message)
+    if not is_admin(admin_id):
+        await message.answer("⛔ Только админ.")
+        return
+    
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        await message.answer("Использование: <code>/unban user_id</code>")
+        return
+    
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        await message.answer("❌ user_id должен быть числом.")
+        return
+    
+    await db.unban_user(target_id)
+    await message.answer(f"✅ Игрок <code>{target_id}</code> разбанен.")
+
+
+@dp.message(Command("setchance"))
+async def cmd_setchance(message: Message) -> None:
+    admin_id = await ensure_user_from_message(message)
+    if not is_admin(admin_id):
+        await message.answer("⛔ Только админ.")
+        return
+    
+    parts = (message.text or "").split()
+    if len(parts) != 3:
+        await message.answer("Использование: <code>/setchance slots|roulette|blackjack 0.XX</code>\nПример: <code>/setchance slots 0.35</code>")
+        return
+    
+    game_type = parts[1].lower()
+    try:
+        chance = float(parts[2])
+    except ValueError:
+        await message.answer("❌ Шанс должен быть числом (0.0-1.0).")
+        return
+    
+    if not 0 <= chance <= 1:
+        await message.answer("❌ Шанс должен быть от 0 до 1.")
+        return
+    
+    setting_map = {
+        "slots": "slots_win_chance",
+        "roulette": "roulette_win_chance",
+        "blackjack": "blackjack_win_chance"
+    }
+    
+    if game_type not in setting_map:
+        await message.answer("❌ Доступные игры: slots, roulette, blackjack")
+        return
+    
+    await db.set_setting(setting_map[game_type], chance)
+    await message.answer(f"✅ Шанс победы в {game_type} изменён на {chance*100:.1f}%")
 
 
 @dp.message(Command("give"))
 async def cmd_give(message: Message) -> None:
-    admin_id = await ensure_user_from_message(message)
-    if not is_admin(admin_id):
-        await message.answer("⛔ Только админ.")
-        return
-
-    parts = (message.text or "").split()
-    if len(parts) != 3:
-        await message.answer("Использование: <code>/give user_id сумма</code>")
-        return
-
-    try:
-        target_id = int(parts[1])
-        amount = int(parts[2])
-    except ValueError:
-        await message.answer("❌ user_id и сумма должны быть числами.")
-        return
-
-    if amount <= 0:
-        await message.answer("❌ Сумма должна быть больше нуля.")
-        return
-
-    await db.ensure_user(target_id, None)
-    new_balance = await db.add_balance(target_id, amount)
-    await message.answer(f"✅ Игроку <code>{target_id}</code> выдано <b>{fmt_money(amount)}</b>\nНовый баланс: <b>{fmt_money(new_balance)}</b>")
-
-
-@dp.message(Command("setbal"))
-async def cmd_setbal(message: Message) -> None:
-    admin_id = await ensure_user_from_message(message)
-    if not is_admin(admin_id):
-        await message.answer("⛔ Только админ.")
-        return
-
-    parts = (message.text or "").split()
-    if len(parts) != 3:
-        await message.answer("Использование: <code>/setbal user_id сумма</code>")
-        return
-
-    try:
-        target_id = int(parts[1])
-        amount = int(parts[2])
-    except ValueError:
-        await message.answer("❌ user_id и сумма должны быть числами.")
-        return
-
-    if amount < 0:
-        await message.answer("❌ Баланс не может быть отрицательным.")
-        return
-
-    await db.ensure_user(target_id, None)
-    new_balance = await db.set_balance(target_id, amount)
-    await message.answer(f"✅ Баланс игрока <code>{target_id}</code>: <b>{fmt_money(new_balance)}</b>")
-
-
-@dp.message(Command("pay"))
-async def cmd_pay(message: Message) -> None:
-    sender_id = await ensure_user_from_message(message)
-    parts = (message.text or "").split()
-    target_id = None
-    amount = None
-
-    if message.reply_to_message and len(parts) == 2:
-        try:
-            amount = int(parts[1])
-        except ValueError:
-            await message.answer("❌ Сумма должна быть числом.")
-            return
-        if message.reply_to_message.from_user is None:
-            await message.answer("❌ Не удалось определить получателя.")
-            return
-        target_id = message.reply_to_message.from_user.id
-        await db.ensure_user(target_id, message.reply_to_message.from_user.username)
-    elif len(parts) == 3:
-        try:
-            target_id = int(parts[1])
-            amount = int(parts[2])
-        except ValueError:
-            await message.answer("❌ user_id и сумма должны быть числами.")
-            return
-        await db.ensure_user(target_id, None)
-    else:
-        await message.answer(
-            "Использование:\n"
-            "<code>/pay user_id сумма</code>\n"
-            "или ответом:\n"
-            "<code>/pay сумма</code>"
-        )
-        return
-
-    if target_id == sender_id:
-        await message.answer("❌ Нельзя переводить самому себе.")
-        return
-    if amount is None or amount <= 0:
-        await message.answer("❌ Сумма должна быть больше нуля.")
-        return
-
-    ok = await db.transfer(sender_id, target_id, amount)
-    if not ok:
-        await message.answer("❌ Недостаточно средств.")
-        return
-
-    sender_balance = await db.get_balance(sender_id)
-    await message.answer(
-        f"💸 Перевод выполнен\n"
-        f"Кому: <code>{target_id}</code>\n"
-        f"Сумма: <b>{fmt_money(amount)}</b>\n"
-        f"Твой баланс: <b>{fmt_money(sender_balance)}</b>"
-    )
-
-
-@dp.callback_query(F.data == "menu:home")
-async def cb_home(call: CallbackQuery) -> None:
-    await ensure_user_from_callback(call)
-    await safe_edit_or_send(call, "🏠 <b>Главное меню</b>", main_menu())
-
-
-@dp.callback_query(F.data == "menu:balance")
-async def cb_balance(call: CallbackQuery) -> None:
-    user_id = await ensure_user_from_callback(call)
-    balance = await db.get_balance(user_id)
-    bet = await db.get_bet(user_id)
-    await safe_edit_or_send(call, f"💰 Баланс: <b>{fmt_money(balance)}</b>\n🎯 Текущая ставка: <b>{fmt_money(bet)}</b>", main_menu())
-
-
-@dp.callback_query(F.data == "menu:help")
-async def cb_help(call: CallbackQuery) -> None:
-    text = (
-        "📘 <b>Помощь</b>\n\n"
-        "/setbet сумма — поставить свою ставку\n"
-        "/pay user_id сумма — перевод\n"
-        "/pay сумма — перевод ответом\n"
-        "/top — общий топ\n"
-        "/topweek — топ недели\n\n"
-        f"Топ-{WEEKLY_WINNERS_COUNT} недели получают по <b>{fmt_money(WEEKLY_REWARD)}</b>."
-    )
-    await safe_edit_or_send(call, text, main_menu())
-
-
-@dp.callback_query(F.data == "menu:admin")
-async def cb_admin(call: CallbackQuery) -> None:
-    user_id = await ensure_user_from_callback(call)
-    if not is_admin(user_id):
-        await call.answer("Нет доступа", show_alert=True)
-        return
-    await safe_edit_or_send(call, "🛠 <b>Админ-панель</b>\n\n<code>/give user_id сумма</code>\n<code>/setbal user_id сумма</code>", main_menu())
-
-
-@dp.callback_query(F.data == "menu:top")
-async def cb_top(call: CallbackQuery) -> None:
-    rows = await db.top_balance(10)
-    text = "🏆 <b>Топ игроков по балансу</b>\n\n"
-    for i, (user_id, username, balance) in enumerate(rows, start=1):
-        text += f"{i}. {fmt_name(user_id, username)} — <b>{fmt_money(balance)}</b>\n"
-    await safe_edit_or_send(call, text, main_menu())
-
-
-@dp.callback_query(F.data == "menu:topweek")
-async def cb_topweek(call: CallbackQuery) -> None:
-    rows = await db.top_week(10)
-    text = f"📅 <b>Топ недели</b>\nТоп-{WEEKLY_WINNERS_COUNT} получают по <b>{fmt_money(WEEKLY_REWARD)}</b>\n\n"
-    for i, (user_id, username, weekly_profit) in enumerate(rows, start=1):
-        text += f"{i}. {fmt_name(user_id, username)} — <b>{fmt_money(weekly_profit)}</b>\n"
-    await safe_edit_or_send(call, text, main_menu())
-
-
-@dp.callback_query(F.data == "menu:bet")
-async def cb_bet_menu(call: CallbackQuery) -> None:
-    user_id = await ensure_user_from_callback(call)
-    bet = await db.get_bet(user_id)
-    text = (
-        "🎯 <b>Текущая ставка</b>\n\n"
-        f"Сейчас: <b>{fmt_money(bet)}</b>\n\n"
-        "Выбери кнопку или напиши:\n"
-        "<code>/setbet сумма</code>"
-    )
-    await safe_edit_or_send(call, text, bet_select_menu())
-
-
-@dp.callback_query(F.data.startswith("setbet:"))
-async def cb_setbet(call: CallbackQuery) -> None:
-    user_id = await ensure_user_from_callback(call)
-    amount = int(call.data.split(":")[1])
-
-    balance = await db.get_balance(user_id)
-    if amount > balance:
-        await call.answer("Ставка больше баланса", show_alert=True)
-        return
-
-    await db.set_bet(user_id, amount)
-    await safe_edit_or_send(call, f"✅ Новая ставка: <b>{fmt_money(amount)}</b>", main_menu())
-
-
-@dp.callback_query(F.data == "menu:slots")
-async def cb_slots(call: CallbackQuery) -> None:
-    user_id = await ensure_user_from_callback(call)
-    bet = await db.get_bet(user_id)
-    balance = await db.get_balance(user_id)
-
-    if balance < bet:
-        await call.answer("Недостаточно денег", show_alert=True)
-        return
-
-    await db.add_balance(user_id, -bet)
-    await db.add_profit(user_id, -bet)
-
-    symbols = ["🍒", "🍋", "💎", "7️⃣", "⭐"]
-
-    try:
-        await call.message.edit_text("🎰 Крутим...")
-        for _ in range(3):
-            spin = " | ".join(random.choice(symbols) for _ in range(3))
-            await asyncio.sleep(0.3)
-            await call.message.edit_text(f"🎰 <b>Слоты</b>\n\n<code>{spin}</code>")
-    except Exception:
-        pass
-
-    result = [random.choice(symbols) for _ in range(3)]
-    line = " | ".join(result)
-
-    if len(set(result)) == 1:
-        mult = 8 if result[0] == "7️⃣" else 5
-        win = bet * mult
-        await db.add_balance(user_id, win)
-        await db.add_profit(user_id, win)
-        text = f"🎰 <b>Слоты</b>\n\n<code>{line}</code>\n\n🔥 Джекпот: <b>{fmt_money(win)}</b>\nБаланс: <b>{fmt_money(await db.get_balance(user_id))}</b>"
-    elif len(set(result)) == 2:
-        win = bet * 2
-        await db.add_balance(user_id, win)
-        await db.add_profit(user_id, win)
-        text = f"🎰 <b>Слоты</b>\n\n<code>{line}</code>\n\n✨ Совпадение: <b>{fmt_money(win)}</b>\nБаланс: <b>{fmt_money(await db.get_balance(user_id))}</b>"
-    else:
-        text = f"🎰 <b>Слоты</b>\n\n<code>{line}</code>\n\n😢 Не повезло.\nБаланс: <b>{fmt_money(await db.get_balance(user_id))}</b>"
-
-    await safe_edit_or_send(call, text, main_menu())
-
-
-@dp.callback_query(F.data == "menu:roulette")
-async def cb_roulette_menu(call: CallbackQuery) -> None:
-    user_id = await ensure_user_from_callback(call)
-    bet = await db.get_bet(user_id)
-    await safe_edit_or_send(call, f"🎡 <b>Рулетка</b>\nТекущая ставка: <b>{fmt_money(bet)}</b>\nВыбери цвет:", roulette_color_menu())
-
-
-@dp.callback_query(F.data.startswith("roulette:"))
-async def cb_roulette_play(call: CallbackQuery) -> None:
-    user_id = await ensure_user_from_callback(call)
-    color = call.data.split(":")[1]
-    bet = await db.get_bet(user_id)
-    balance = await db.get_balance(user_id)
-
-    if balance < bet:
-        await call.answer("Недостаточно денег", show_alert=True)
-        return
-
-    await db.add_balance(user_id, -bet)
-    await db.add_profit(user_id, -bet)
-
-    try:
-        await call.message.edit_text("🎡 Крутим рулетку...")
-        await asyncio.sleep(0.8)
-    except Exception:
-        pass
-
-    number = random.randint(0, 36)
-    real_color = random.choice(["red", "black"])
-    color_text = "🔴 Красное" if real_color == "red" else "⚫ Чёрное"
-
-    if color == real_color:
-        win = bet * 2
-        await db.add_balance(user_id, win)
-        await db.add_profit(user_id, win)
-        text = f"🎡 <b>Рулетка</b>\n\nВыпало: <b>{number}</b> — {color_text}\n🎉 Выигрыш: <b>{fmt_money(win)}</b>\nБаланс: <b>{fmt_money(await db.get_balance(user_id))}</b>"
-    else:
-        text = f"🎡 <b>Рулетка</b>\n\nВыпало: <b>{number}</b> — {color_text}\n😢 Проигрыш.\nБаланс: <b>{fmt_money(await db.get_balance(user_id))}</b>"
-
-    await safe_edit_or_send(call, text, main_menu())
-
-
-@dp.callback_query(F.data == "menu:blackjack")
-async def cb_blackjack_start(call: CallbackQuery) -> None:
-    user_id = await ensure_user_from_callback(call)
-    bet = await db.get_bet(user_id)
-    balance = await db.get_balance(user_id)
-
-    if balance < bet:
-        await call.answer("Недостаточно денег", show_alert=True)
-        return
-
-    await db.add_balance(user_id, -bet)
-    await db.add_profit(user_id, -bet)
-
-    player = card_value() + card_value()
-    dealer = card_value() + card_value()
-    blackjack_games[user_id] = BJGame(bet=bet, player_total=player, dealer_total=dealer)
-
-    if player == 21:
-        win = int(bet * 2.5)
-        await db.add_balance(user_id, win)
-        await db.add_profit(user_id, win)
-        blackjack_games.pop(user_id, None)
-        await safe_edit_or_send(call, f"🃏 <b>Блэкджек</b>\n\nУ тебя: <b>{player}</b>\nУ дилера: <b>{dealer}</b>\n\n🔥 Натуральный блэкджек! <b>{fmt_money(win)}</b>\nБаланс: <b>{fmt_money(await db.get_balance(user_id))}</b>", main_menu())
-        return
-
-    await safe_edit_or_send(call, f"🃏 <b>Блэкджек</b>\n\nТвоя сумма: <b>{player}</b>\nУ дилера скрыто. Видно: <b>{max(2, dealer - 1)}</b>+\nСтавка: <b>{fmt_money(bet)}</b>", blackjack_menu())
-
-
-@dp.callback_query(F.data == "blackjack:hit")
-async def cb_blackjack_hit(call: CallbackQuery) -> None:
-    user_id = await ensure_user_from_callback(call)
-    game = blackjack_games.get(user_id)
-    if game is None:
-        await call.answer("Игра не найдена", show_alert=True)
-        return
-
-    game.player_total += card_value()
-
-    if game.player_total > 21:
-        blackjack_games.pop(user_id, None)
-        await safe_edit_or_send(call, f"🃏 <b>Блэкджек</b>\n\nТвоя сумма: <b>{game.player_total}</b>\n💥 Перебор.\nБаланс: <b>{fmt_money(await db.get_balance(user_id))}</b>", main_menu())
-        return
-
-    await safe_edit_or_send(call, f"🃏 <b>Блэкджек</b>\n\nТвоя сумма: <b>{game.player_total}</b>\nУ дилера скрыто. Видно: <b>{max(2, game.dealer_total - 1)}</b>+\nСтавка: <b>{fmt_money(game.bet)}</b>", blackjack_menu())
-
-
-@dp.callback_query(F.data == "blackjack:stand")
-async def cb_blackjack_stand(call: CallbackQuery) -> None:
-    user_id = await ensure_user_from_callback(call)
-    game = blackjack_games.get(user_id)
-    if game is None:
-        await call.answer("Игра не найдена", show_alert=True)
-        return
-
-    while game.dealer_total < 17:
-        game.dealer_total += card_value()
-
-    if game.dealer_total > 21 or game.player_total > game.dealer_total:
-        win = game.bet * 2
-        await db.add_balance(user_id, win)
-        await db.add_profit(user_id, win)
-        result = f"🎉 Победа! Выигрыш: <b>{fmt_money(win)}</b>"
-    elif game.player_total == game.dealer_total:
-        await db.add_balance(user_id, game.bet)
-        await db.add_profit(user_id, game.bet)
-        result = f"🤝 Ничья. Возврат: <b>{fmt_money(game.bet)}</b>"
-    else:
-        result = "😢 Проигрыш."
-
-    blackjack_games.pop(user_id, None)
-    await safe_edit_or_send(call, f"🃏 <b>Блэкджек</b>\n\nТвоя сумма: <b>{game.player_total}</b>\nСумма дилера: <b>{game.dealer_total}</b>\n\n{result}\nБаланс: <b>{fmt_money(await db.get_balance(user_id))}</b>", main_menu())
-
-
-@dp.message()
-async def fallback(message: Message) -> None:
-    await ensure_user_from_message(message)
-    await message.answer("Не понял сообщение. Используй /start или /menu")
-
-
-async def weekly_rewards_loop(bot: Bot) -> None:
-    stored_week = await db.get_state("current_week")
-    if stored_week is None:
-        await db.set_state("current_week", current_week_key())
-
-    while True:
-        await asyncio.sleep(60)
-        now_week = current_week_key()
-        stored_week = await db.get_state("current_week")
-
-        if stored_week != now_week:
-            winners = await db.reward_weekly_top()
-            await db.set_state("current_week", now_week)
-
-            if winners:
-                text = f"📅 <b>Недельные награды выданы!</b>\n\nТоп-{WEEKLY_WINNERS_COUNT} получили по <b>{fmt_money(WEEKLY_REWARD)}</b>\n\n"
-                for i, (user_id, username) in enumerate(winners, start=1):
-                    text += f"{i}. {fmt_name(user_id, username)}\n"
-
-                for user_id, _ in winners:
-                    try:
-                        await bot.send_message(user_id, text)
-                    except Exception:
-                        pass
-
-
-async def main() -> None:
-    global db
-
-    if BOT_TOKEN in ("", "PASTE_TOKEN_HERE", None):
-        raise RuntimeError("Вставь BOT_TOKEN в переменные окружения")
-
-    db = Database(DB_PATH)
-    await db.connect()
-
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-
-    rewards_task = asyncio.create_task(weekly_rewards_loop(bot))
-    print("BOT STARTED")
-
-    try:
-        await dp.start_polling(bot)
-    finally:
-        rewards_task.cancel()
-        await bot.session.close()
-        await db.close()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    admin_id = await ensure
+    
